@@ -6,7 +6,7 @@ rm(list = ls())
 
 dpts <- c(22,29,56)
 res <- 1000
-r <- 1000
+r <- 2000
 
 tauLake <- 2500
 tauCoast <- 2500

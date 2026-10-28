@@ -1,111 +1,130 @@
 library(tidyverse)
-library(sf)
+
 library(ppmlasso)
+library(splines)
+library(pROC)
+
+library(sf)
+library(terra)
+library(spatstat)
 
 rm(list = ls())
 
 source("fun/fix_ppmlasso.R")
+source("fun/myUtilities.R")
 
-dpts <- c(22,29,56)
-res <- 1000
-
-tauLake <- 1500
-tauCoast <- 1500
-
-paths <- list(background_grid = "data/background_grid_22-29-56_res1000m_fit_r2000.geojson",
+paths <- list(bg = paste0("data/bg250m.rds"),
+              studyArea = "data/SpatialData/contour-des-departements.geojson",
               collisions = "data/CollisionData/synthese_observations_2025-03-24T10_12_28.148Z.geojson")
-
-form <- ~ otterIntensity + roadLen + roadLen.1 + roadLen.2 + roadLen.3 + roadLen.4 + roadLen.5 + 
-  + crossing * (z + riverLen + riverSin + maxStra + lakeProx + treeCover + roadSideVegetation + riverSideVegetation + waterBodyArea +
-                  Cultures + coastProx + distUrban) 
 
 ### 1. LOAD DATA ---------------------------------------------------------------
 
-background_grid <- read_sf(paths$background_grid) %>%
-  mutate_all(~replace_na(.x, 0)) %>%
-  mutate(lakeProx = exp(-distLake/tauLake),
-         coastProx = exp(-distCoast/tauCoast)) 
+studyArea <- read_sf(paths$studyArea) %>%
+  filter(code %in% c(22,29,56)) %>%
+  select(geometry, code) %>%
+  st_transform(2154)
+
+bg <- readRDS(paths$bg) %>%
+  filter(roadImportance > 0) %>%
+  mutate(maxStra = ifelse(crossings3, straCross, maxStra),
+         maxStra = ifelse(maxStra == 8, 7, maxStra),
+         roadImportance = ifelse(crossings3, roadCross, roadImportance)) %>% 
+  mutate(id = 1:n())
 
 collisions <- read_sf(paths$collisions) %>%
-  st_transform(crs = 2154) %>%
   filter(year(date_debut) > 2000) %>%
-  st_intersection(st_union(background_grid))
+  st_transform(crs = 2154) %>%
+  st_intersection(st_union(studyArea)) %>%
+  distinct(geometry)
 
-### 2. PERFORM CROSS VALIDATION
+spxy <- collisions %>%
+  st_coordinates %>%
+  as.data.frame
 
-Niters <- 50
-nBlocks <- 8
-muCV <- matrix(0, nrow(background_grid), Niters)
+myppmdata <- ppmdat(sp.xy = spxy, back.xy = bg, 
+                    coord = c("X", "Y"), sp.scale = 500, writefile = FALSE)
 
-for(i in 1:Niters){
+form <- ~ (rivers == 0) + roadImportance + wetlands  +  crossings3 +
+  roads + otterDensity + altitude + cultures + treeCover + rivers + maxStra + 
+  exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500)
+
+fit <- ppmlasso(form, data = myppmdata, n.fits = 20, sp.scale = 500, coord=c("X","Y"),
+                standardise = TRUE, writefile = FALSE)
+
+mu <- predict.ppmlasso(fit, newdata = bg)* 1e+06
+
+### 2. PERFORM CROSS VALIDATION ------------------------------------------------
+
+blocks <- list(as.numeric(as.factor(cut(bg$X, breaks = 8))),
+               as.numeric(as.factor(cut(bg$Y, breaks = 8))),
+               as.numeric(as.factor(cut(bg$X, breaks = 5))),
+               as.numeric(as.factor(cut(bg$Y, breaks = 5))),
+               as.numeric(as.factor(cut(c(bg$Y-min(bg$Y))**2 + c(bg$X-min(bg$X))**2, breaks = 5))),
+               as.numeric(as.factor(cut(c(bg$Y-max(bg$Y))**2 + c(bg$X-max(bg$X))**2, breaks = 5))),
+               as.numeric(as.factor(paste(cut(bg$X, breaks = 4), cut(bg$Y, breaks = 2)))),
+               as.numeric(as.factor(paste(cut(bg$X, breaks = 2), cut(bg$Y, breaks = 4)))),
+               as.numeric(as.factor(paste(cut(bg$X, breaks = 3), cut(bg$Y, breaks = 3)))))
+
+muCV <- matrix(0, nrow(bg), length(blocks))
+
+bg_sp <- st_as_sf(bg, coords = c("X", "Y"), crs = 2154) %>%
+  st_buffer(125, endCapStyle = "SQUARE")
+
+for(i in 1:length(blocks)){
+  cat(i, "\n")
   ### a. GET VALIDATION BLOCKS ---------------------------------------------------
   
-  bg_i <- st_make_grid(st_bbox(background_grid), cellsize = c(5000, 5000)) %>%
-    st_as_sf(crs = 2154) %>%
-    mutate(CVblock = sample(1:nBlocks, n(), replace = TRUE)) %>%
-    st_intersection(st_centroid(background_grid)) %>%
-    st_drop_geometry %>%
-    select(id, CVblock) %>%
-    left_join(background_grid) %>%
-    st_as_sf(crs = 2154)
-  
   ### b. ARRANGE DATA ------------------------------------------------------------
+  bg_i <- mutate(bg, block = blocks[[i]])
+  bg_sp_i <- mutate(bg_sp, block = blocks[[i]])
   
-  bgxy <- cbind(bg_i, st_coordinates(st_centroid(bg_i))) %>%
-    st_drop_geometry()
-  
-  spxy <- collisions %>%
-    st_intersection(select(bg_i, CVblock), .) %>% 
+  coll_i <- collisions %>%
+    st_intersection(select(bg_sp_i, block), .) %>% 
     cbind(., st_coordinates(.)) %>%
     st_drop_geometry() %>%
-    select(CVblock, X, Y)
+    select(block, X, Y)
   
   ### c. FIT AND PREDICT ---------------------------------------------------------
   
-  bgxy_allbutCV <- map(unique(bg_i$CVblock),
-                       ~ filter(bgxy, CVblock != .x))
-  bgxy_onlyCV <- map(unique(bg_i$CVblock),
-                     ~ filter(bgxy, CVblock == .x))
+  bg_fit <- map(unique(bg_i$block),
+                  ~ filter(bg_i, block != .x))
+  bg_pred <- map(unique(bg_i$block),
+                     ~ filter(bg_i, block == .x))
   
-  spxy_allbutCV <- map(unique(bg_i$CVblock),
-                       ~ filter(spxy, CVblock != .x))
-  spxy_onlyCV <- map(unique(bg_i$CVblock),
-                     ~ filter(spxy, CVblock == .x))
+  coll_fit <- map(unique(bg_i$block),
+                       ~ filter(coll_i, block != .x))
+  coll_pred <- map(unique(bg_i$block),
+                     ~ filter(coll_i, block == .x))
   
-  ppmdata <- map2(
-    spxy_allbutCV,
-    bgxy_allbutCV,
+  myppmdata_i <- map2(
+    coll_fit,
+    bg_fit,
     ppmdat,
     coord = c("X", "Y"),
     sp.scale = 1000,
     writefile = FALSE
   )
-  ppmfit <- map(
-    ppmdata,
+  fit_i <- map(
+    myppmdata_i,
     ~ ppmlasso(
       data = .x,
       formula = form,
       sp.scale = res,
       coord = c("X", "Y"),
-      r = 2000,
-      family = "area.inter",
-      n.fits = 1,
-      lamb = 5.77,
+      lamb = fit$lambda,
       standardise = TRUE,
       writefile = FALSE
     )
   )
   
-  ixs <- map(unique(bg_i$CVblock), ~ bgxy$pt.interactions[bgxy$CVblock == .x])
+  mus_i <- pmap(list(
+    object = fit_i,
+    newdata = bg_pred
+    ),
+    predict.ppmlasso)
   
-  ppmpredict <- pmap(list(
-    object = ppmfit,
-    newdata = bgxy_onlyCV,
-    interactions = ixs
-  ),
-  predict.ppmlasso)
-  
-  muCV[, i] <- map2(bgxy_onlyCV, ppmpredict, ~ mutate(.x, muCV = .y[, 1] * 1e+06)) %>%
+  muCV[, i] <- map2(bg_pred,
+                    mus_i, ~ mutate(.x, muCV = .y[, 1] * 1e+06)) %>%
     reduce(rbind) %>%
     select(id, muCV) %>%
     left_join(bg_i, .) %>%
@@ -114,35 +133,50 @@ for(i in 1:Niters){
     replace_na(0)
 }
 
-### 5. PLOT --------------------------------------------------------------------
+### 5. SUMMARIZE ---------------------------------------------------------------
 
-apply(muCV, 2, cor, background_grid$mu) %>% t.test
+jaccard <- function(a, b){
+  u <- intersect(a,b)
+  length(u) / (length(a) + length(b) - length(u))
+}
+
+apply(muCV, 2, function(x,y){
+  jaccard(which(x > quantile(x, 0.95)),
+          which(y > quantile(y, 0.95)))},
+  mu) %>% t.test
 
 # 95 percent confidence interval:
-#   0.9330619 0.9483371
+#   0.7820319 0.8866666
 # sample estimates:
 #   mean of x 
-# 0.9406995 
+# 0.8343492
 
-apply(log(muCV), 2, function(x,y){mean(abs((x - y)/mean(y)))}, background_grid$logMu) %>% t.test
+apply(muCV, 2, cor, mu, method = "spear") %>% t.test
 
 # 95 percent confidence interval:
-#   0.01285255 0.01334518
+#   0.9759670  0.9893847
 # sample estimates:
 #   mean of x 
-# 0.01309887 
+# 0.9826758  
 
-background_grid$avg_muCV <- apply(muCV, 1, mean)
+apply(log(muCV), 2, function(x,y){mean(abs((x - y)/mean(y)))}, log(mu)) %>% t.test
 
-ggplot(background_grid) +
-  geom_sf(aes(fill = log(avg_muCV/mu)), col = NA)+
-  scale_fill_gradient2(low = "red", high = "green", mid = "white", midpoint = 0,
-                       name = "log(\u00B5CV/\u00B5)") +
-  theme(panel.grid.major = element_line(color = "lightgrey"),
-        axis.ticks = element_blank())
+# 95 percent confidence interval:
+#   0.03181962 0.04160178
+# sample estimates:
+#   mean of x 
+# 0.0367107 
 
-ggsave("out/CVmap.png",  width = 29.7, height = 21, unit = "cm")
+coll <- 1 - (st_intersects(bg_sp, collisions) %>% sapply(is_empty))
 
-### 6. BOYCE INDEX -------------------------------------------------------------
+apply(muCV, 2, function(x, y){
+  rocdat <- data.frame(mu = x, coll = y)
+  as.numeric(roc_(data = rocdat, "coll", "mu")$auc)
+}, coll) %>% t.test
 
-BI <- ecospat::ecospat.boyce(background_grid$mu, st_intersection(collisions, background_grid)$mu)
+# alternative hypothesis: true mean is not equal to 0
+# 95 percent confidence interval:
+#   0.9207811 0.9258190
+# sample estimates:
+#   mean of x 
+# 0.9233 

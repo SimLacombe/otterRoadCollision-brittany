@@ -58,3 +58,4 @@ predict.ppmlasso = function(object, ..., newdata, interactions = NA)
 }
 
 setMethod("predict", "ppmlasso", predict.ppmlasso)
+

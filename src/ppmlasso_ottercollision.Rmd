@@ -1,0 +1,764 @@
+---
+title: "ppmlasso_ottercollision"
+author: "SimLac"
+date: "2026-05-08"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r set environment}
+
+library(tidyverse)
+
+library(ppmlasso)
+library(splines)
+library(pROC)
+
+library(sf)
+library(terra)
+library(spatstat)
+
+rm(list = ls())
+
+source("fun/fix_ppmlasso.R")
+source("fun/myUtilities.R")
+
+res <- 250
+
+paths <- list(bg = paste0("data/bg",res,"m.rds"),
+              studyArea = "data/SpatialData/contour-des-departements.geojson",
+              collisions = "data/CollisionData/synthese_observations_2025-03-24T10_12_28.148Z.geojson")
+
+```
+
+```{r load and prepare data}
+
+studyArea <- read_sf(paths$studyArea) %>%
+  filter(code %in% c(22,29,56)) %>%
+  select(geometry, code) %>%
+  st_transform(2154) %>%
+  st_union
+
+bg <- readRDS(paths$bg) %>%
+  filter(roadImportance > 0) %>%
+  mutate(maxStra = ifelse(crossings3, straCross, maxStra),
+         maxStra = ifelse(maxStra == 8, 7, maxStra),
+         roadImportance = ifelse(crossings3, roadCross, roadImportance))
+
+bg <- bg[!sapply(st_within(st_as_sf(bg, coords = c("X", "Y"), crs = 2154), studyArea), is_empty), ]
+
+collisions <- read_sf(paths$collisions) %>%
+  filter(year(date_debut) > 2000) %>%
+  st_transform(crs = 2154) %>%
+  st_intersection(st_union(studyArea))
+
+```
+
+### 1. Fit main model
+
+##### a. Set up main model
+
+```{r set up main model, message=FALSE, warning=FALSE}
+
+rad <- 1000
+
+spxy <- collisions %>%
+  st_coordinates %>%
+  as.data.frame
+
+myppmdata <- ppmdat(sp.xy = spxy, back.xy = bg, 
+                    coord = c("X", "Y"), sp.scale = res, writefile = FALSE)
+
+```
+
+##### b. Fit main model
+
+```{r fit main model}
+
+form <- ~ (rivers == 0) + (otterPresence != 0) +
+  crossings3 * (roads + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distLake/1000) + exp(-distCoast/2500) + exp(-distUrban/500) + exp(-distRoad/500))
+
+fit <- ppmlasso(form, data = myppmdata, n.fits = 20, sp.scale = res, coord=c("X","Y"),
+                r = rad, family = "area.inter", 
+                standardise = TRUE, writefile = FALSE)
+
+out <- mutate(bg,
+              mu = fit$mu[(nrow(spxy)+1):length(fit$mu)]*250**2,
+              pt.interactions = fit$pt.interactions[(nrow(spxy)+1):length(fit$pt.interactions)])
+
+out <- write_rds(out, paste0("out/out250m.rds"))
+```
+
+##### c. Plot main model's output
+
+```{r plot main - risk map}
+
+ggplot(out) + 
+  geom_tile(aes(x = X, y = Y, fill = log(mu)), col = NA) + 
+  paletteer::scale_fill_paletteer_c("grDevices::Lajolla", name = "log(\u00B5)")+
+  coord_fixed() + 
+  theme_void()
+
+ggsave(filename = "out/riskMap.png", width = 29.7, height = 21, units = "cm")
+
+```
+
+```{r plot covs}
+
+p1 <- ggplot(out)+
+  geom_smooth(aes(x = roadImportance, y = log(mu),
+              col = factor(crossings3)),
+              method = "lm", formula = y ~ns(x, df = 3)) +
+    facet_wrap(~"road importance") +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  xlab("") + ylab("log(\u00B5)") +
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p2 <- ggplot(filter(out)) +
+  geom_smooth(aes(x = pt.interactions, y = log(mu), col = factor(crossings3))) +
+  facet_wrap(~"point interactions") +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  xlab("") + ylab("") +
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p3 <- ggplot(filter(out, rivers < quantile(rivers, 0.95)))+
+  geom_smooth(aes(x = rivers, y = log(mu), col = factor(crossings3))) +
+  facet_wrap(~"river density (m)") +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  xlab("") + ylab("log(\u00B5)") +
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p4 <- ggplot(filter(out, maxStra > 0))+
+  geom_smooth(aes(x = maxStra, y = log(mu),
+                  col = factor(crossings1)),
+              method = "lm", formula = y ~ ns(x, df = 3)) +
+  facet_wrap(~"max. Strahler") +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  xlab("") + ylab("") +
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p6 <- ggplot(filter(out, distRoad < 5000, roadImportance > 1))+
+  geom_smooth(aes(x = distRoad, y = log(mu), col = factor(crossings3))) +
+  facet_wrap(~"distance to national roads (m)") +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  xlab("") + ylab("") +
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p5 <- ggplot(filter(out, treeCover < quantile(treeCover, 0.95)))+
+  geom_smooth(aes(x = treeCover/(2.5*2.5), y = log(mu), col = factor(crossings3))) +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  facet_wrap(~"tree cover (%)") +
+  xlab("") + ylab("log(\u00B5)") +
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p7 <- ggplot(filter(out, distLake < 5000))+
+  geom_smooth(aes(x = distLake, y = log(mu), col = factor(crossings3))) +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  facet_wrap(~"distance to lake (m)") +
+  xlab("") + ylab("") + 
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p8 <- ggplot(summarize(group_by(out, otterPresence !=0, crossings3),
+                       y = mean(mu),
+                       ymin = mean(mu) - 1.96 * sd(mu)/sqrt(n()),
+                       ymax = mean(mu) + 1.96 * sd(mu)/sqrt(n())))+
+  geom_line(aes(x =as.numeric(`otterPresence != 0`),y = log(y), col = factor(crossings3)),
+            linewidth = 1) +
+  geom_ribbon(aes(x = as.numeric(`otterPresence != 0`),
+                  ymin = log(ymin), ymax = log(ymax), group = factor(crossings3)), col = "lightgrey", alpha = 0.33) +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  facet_wrap(~"otter presence") +
+  xlab("") + ylab("") + 
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+p9 <- ggplot(filter(out))+
+  geom_smooth(aes(x = rivers, y = log(mu), col = factor(crossings3))) +
+  facet_wrap(~"road density (m)") +
+  scale_color_manual(values = c("#476F84FF", "#72874EFF"), name = "crossing") +
+  xlab("") + ylab("log(\u00B5)") +
+  theme_bw() + 
+  theme(text = element_text(face = "bold"))
+
+ggpubr::ggarrange(plotlist = list(p1, p2, p3, p4, p5, p6, p7, p8, p9), nrow = 3, ncol = 3,
+                  common.legend = TRUE ,legend = "bottom")
+
+ggsave(filename = "out/covEffects.png", width = 29.7, height = 21, units = "cm")
+
+```
+
+```{r, variable contribution}
+
+forms <- list(crossings = ~ (rivers == 0) + roads + (otterPresence != 0) + altitude + cultures + treeCover  + rivers +
+                                ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500),
+              rivers = ~ 
+                crossings3 * (roads + otterPresence + altitude + cultures + treeCover  +
+                                ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+              roads = ~ (rivers == 0) + 
+                crossings3 * ((otterPresence != 0) + altitude + cultures + treeCover  +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+              strahler = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover  +
+                                rivers + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+              roadImportance = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover  +
+                                rivers + ns(maxStra, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+              otterPresence = ~ (rivers == 0) + 
+                crossings3 * (roads + altitude + cultures + treeCover  +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+             cultures = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + treeCover  +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+             altitude = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + cultures + treeCover  +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+             treeCover = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + cultures + 
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+             distLake = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distCoast/10000) + exp(-distUrban/500) + exp(-distRoad/500)),
+             distCoast = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distUrban/500) + exp(-distRoad/500)),
+             distUrban = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distRoad/500)), 
+             distRoad = ~ (rivers == 0) + 
+                crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover +
+                                rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                                exp(-distLake/1000) + exp(-distCoast/10000) + exp(-distUrban/500))
+              
+  )
+
+myppmdata_lowres <- ppmdat(sp.xy = spxy, back.xy = bg, 
+                    coord = c("X", "Y"), sp.scale = 1000, writefile = FALSE)
+
+fit_ref <-  ppmlasso(form, data = myppmdata_lowres, lamb = fit$lambda, sp.scale = 1000, coord=c("X","Y"),
+                     r = 2000, family = "area.inter", 
+                     standardise = TRUE, writefile = FALSE)
+
+fits <- map(forms, ~ ppmlasso(.x, data = myppmdata_lowres, lamb = fit$lambda, sp.scale = 1000, coord=c("X","Y"),
+                              r = 2000, family = "area.inter", 
+                              standardise = TRUE, writefile = FALSE))
+
+fits <- append(fits, 
+               list(interactions = ppmlasso(form, data = myppmdata_lowres, lamb = fit$lambda, sp.scale = 1000, coord=c("X","Y"),
+                                               standardise = TRUE, writefile = FALSE)))
+
+data.frame(dL = fit_ref$likelihood - reduce(map(fits, "likelihood"), c),
+           var = names(fits)) %>%
+  ggplot()+
+  geom_col(aes(x = reorder(var, -dL), y = dL)) +
+  geom_hline(aes(yintercept = 5), linetype = "dashed") +
+  ylab("log-likelihood loss") + xlab("")+
+  theme_bw() + 
+  facet_wrap(~dL<10, scale = "free_x", nrow = 2)+
+  theme(axis.text = element_text(face = "bold"),
+        strip.background = element_blank(),
+        strip.text = element_blank())
+
+ggsave(filename = "out/covContribution.png", width = 25, height = 12.5, units = "cm")
+```
+
+```{r mitigation implications}
+
+risk_dat <- mutate(out, 
+                   id = 1:n())
+
+risk_dat <- st_buffer(st_as_sf(risk_dat, coords = c("X", "Y"),
+                                     crs = 2154),
+                            dist = 125, endCapStyle = "SQUARE") %>%
+  st_intersection(collisions) %>% 
+  st_drop_geometry %>%
+  group_by(id) %>%
+  summarize(ncoll = n()) %>% 
+  right_join(risk_dat) %>%
+  mutate(ncoll = replace_na(ncoll, 0))
+
+risk_dat_road <- risk_dat %>%
+  filter(crossings3==0) %>% 
+  arrange(desc(mu)) %>% 
+  mutate(cum_colls = cumsum(ncoll),
+         length_mitig = cumsum(roads))
+
+risk_dat_cross <- risk_dat %>%
+  filter(crossings3==1) %>% 
+  arrange(desc(mu)) %>% 
+  mutate(cum_colls = cumsum(ncoll),
+         nCross = 1:n())
+
+p21 <- ggplot(risk_dat_road)+
+  geom_line(aes(x = length_mitig/1000, y = cum_colls), col = "blue")+
+  geom_ribbon(aes(x = length_mitig/1000, ymin = 0,
+                  ymax = mu/max(mu)*500),
+              alpha = .5, fill = "lightblue")+
+  geom_path(data = data.frame(),
+            aes(x = c(-Inf, 1004, 1004), y = c(187, 187, -Inf)), linetype = "dashed", size = 1) +
+  geom_point(data = data.frame(),
+            aes(x = 1004, y = 187), size = 3) +
+  xlim(c(0,10000)) +
+  xlab("Roads with mitigation (km)") +
+  scale_y_continuous(name = "Max. collisions avoided",
+                     sec.axis = sec_axis(trans=~./500*max(risk_dat_road$mu),
+                                          name="Collision risk"),
+                     limits = c(0,250)
+  )+
+  theme_bw()+ 
+  theme(text = element_text(face = "bold"))
+
+p22 <- ggplot(risk_dat_cross)+
+  geom_line(aes(x = nCross, y = cum_colls), col = "red")+
+  geom_ribbon(aes(x = nCross, ymin = 0,
+                  ymax = mu/max(mu)*50), alpha = .5, fill = "orange")+
+  geom_path(data = data.frame(),
+            aes(x = c(-Inf, 96, 96), y = c(57, 57, -Inf)), linetype = "dashed", size = 1) +
+  geom_point(data = data.frame(),
+            aes(x = 96, y = 57), size = 3) +
+  xlim(c(0,250)) +
+  xlab("Crossings with mitigation") +
+  scale_y_continuous(name = "Max. collisions avoided",
+                     sec.axis = sec_axis(trans=~./50*max(risk_dat_cross$mu),
+                                          name="Collision risk")
+  )+
+  theme_bw()+ 
+  theme(text = element_text(face = "bold"))
+
+p23 <- ggplot() +
+  geom_sf(data = studyArea)+
+  geom_tile(data = filter(out, roadImportance <= 3), aes(x = X, y = Y), col = NA, alpha = 0.33) + 
+  paletteer::scale_fill_paletteer_c("grDevices::Lajolla", name = "log(\u00B5)")+
+  geom_point(data = filter(risk_dat_road, length_mitig <= 1004000),
+            aes(x=X, y = Y), pch = 15, size = .25, col = "blue", col = NA)  +
+  geom_point(data = filter(risk_dat_cross, nCross <= 96),
+            aes(x=X, y = Y),col = "red") +
+  theme_void()
+
+ggpubr::ggarrange(ggpubr::ggarrange(p21, p22, nrow = 2), p23, ncol = 2, widths = c(0.4, 0.6))
+
+ggsave(filename = "out/mitigationImplications.png", width = 29.7, height = 21, units = "cm")
+
+```
+
+### 2. Effect of res and scale parameter
+
+```{r res and scale parameters}
+
+findRes(scales = c(250,500, 1000, 2000, 10000), 
+        formula = form, sp.xy = spxy, env.grid = bg, coord = c("X", "Y"))
+
+myppmdatabis <- ppmdat(sp.xy = spxy, back.xy = bg, 
+                       coord = c("X", "Y"), sp.scale = 1000, writefile = FALSE)
+
+form1 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distLake/500))
+form2 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distLake/1000))
+form3 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distLake/2500))
+form4 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distLake/5000))
+form5 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distLake/5000))
+form6 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distCoast/500))
+form7 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distCoast/1000))
+form8 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distCoast/2500))
+form9 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distCoast/5000))
+form10 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distCoast/10000))
+form11 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distUrban/500))
+form12 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distUrban/1000))
+form13 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distUrban/2500))
+form14 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distUrban/5000))
+form15 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distUrban/10000))
+
+form16 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distRoad/500))
+form17 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distRoad/1000))
+form18 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distRoad/2500))
+form19 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distRoad/5000))
+form20 <- ~ (rivers == 0) + 
+  crossings3 * (roads + (otterPresence != 0) + altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + ns(roadImportance, df = 3) + 
+                  exp(-distRoad/10000))
+
+liks <- map(list(form1, form2, form3, form4, form5,
+                 form6, form7, form8, form9, form10,
+                 form11, form12, form13, form14, form15,
+                 form16, form17, form18, form19, form20),
+            ~ ppmlasso(.x, data = myppmdatabis, lamb = 0.1, 
+                       sp.scale = 1000,
+                       coord=c("X","Y"), writefile = FALSE)) %>%
+  map(~.x$likelihoods) %>%
+  reduce(c)
+
+data.frame(scale = rep(c(500,1000,2500,5000, 10000), 4),
+           lik = na.omit(liks),
+           var = rep(c("lake", "coast", "urban", "roads"), each = 5)) %>%
+  ggplot()+
+  geom_point(aes(x = scale, y = lik, col = var))+
+  geom_line(aes(x = scale, y = lik, col = var))+
+  ylab("log likelihood")+ xlab("scale (m)") +
+  ggthemes::theme_clean()+
+  theme(plot.background = element_blank(),
+        text = element_text(face = "bold"))
+
+```
+
+
+### 3. Check clustering
+
+```{r check clustering}
+
+lamb <- ifelse(exists("fit"), fit$lambda, 21.44)
+
+rads <- c(0, 1000, 2000, 4000) 
+fams <- c("area.inter", "poisson")[(rads == 0) +1]
+
+fits <- map2(fams, rads, 
+             ~ ppmlasso(form, data = myppmdata, family = .x, r = .y, lamb = lamb, 
+                        sp.scale = res, coord=c("X","Y"), standardise = TRUE, writefile = FALSE)) %>%
+  map(~ .x$mu[(nrow(spxy)+1):(nrow(spxy)+nrow(bg))]) %>%
+  reduce(cbind)
+
+study_win <- as.owin(st_union(studyArea))
+
+bg_rast <- rast(xmin = study_win$xrange[1], xmax = study_win$xrange[2],
+                ymin = study_win$yrange[1], ymax = study_win$yrange[2],
+                resolution = res, crs = "EPSG:2154")
+
+bg_sf <- st_as_sf(bg, coords = c("X", "Y"), crs = 2154) %>%
+  select 
+
+bg_sf <- cbind(bg_sf, fits)
+colnames(bg_sf)[1:length(rads)] <- rads
+
+out_rasts <- map(as.character(rads), 
+               ~ rasterize(bg_sf, bg_rast, field = .x, background = 0))
+
+true_pp <- ppp(spxy$X, spxy$Y, window = as.owin(st_union(studyArea)))
+
+Kinhom_envelopes <- map(1:length(rads),
+                        ~ envelope(true_pp, Kinhom, nsim = 99,
+                                   simulate = expression(
+                                     rpoispp(lambda = as.im(stars::st_as_stars(out_rasts[[.x]])),
+                                             lmax = max(fits[[.x]]),
+                                             win = study_win))))
+
+Kinhom_envelopes <- map2(Kinhom_envelopes, as.character(rads),
+                         ~ mutate(as.data.frame(.x), rad = paste0("interaction radius: ", .y))) %>%
+  reduce(rbind)
+
+ggplot(Kinhom_envelopes) +
+  geom_line(aes(x = r, y = sqrt(obs) - sqrt(r)), col = "red", linewidth = .75)+
+  geom_line(aes(x = r, y = sqrt(mmean) - sqrt(r)), linetype = "dashed", linewidth = .75)+
+  geom_ribbon(aes(x = r, ymin = sqrt(lo) - sqrt(r), ymax = sqrt(hi)- sqrt(r)), alpha = .5)+
+  xlim(c(0,10000))+ylim(c(0,22000))+
+  ylab(expression(sqrt(hat(K)) - sqrt(r)))+
+  theme_bw() +
+  facet_wrap(~ factor(rad, levels = paste0("interaction radius: ", rads)), nrow = 3) +
+  theme_bw() +
+  theme(plot.background = element_blank())
+
+```
+
+### 4. Effect of thinning
+
+```{r fit models to thinned data}
+
+form_bis <- ~ (rivers == 0) + crossings3 * ns(maxStra, df = 3) + roads + (otterPresence != 0) + 
+  altitude + cultures + treeCover + wetlands  + rivers + ns(roadImportance, df = 3) + 
+  exp(-distLake/1000) + exp(-distCoast/2500) + exp(-distUrban/500) + exp(-distRoad/500)
+
+ncoll <- nrow(spxy)
+
+lamb <- fit$lambda
+
+thinning_lvls <- c(rep(c(80, 120, 160, 200, 240, 280), each = 10), nrow(collisions))
+
+myppmdata_lowres <- ppmdat(sp.xy = spxy,
+                            back.xy = bg, sp.scale = 1000, 
+                            coord = c("X", "Y"), writefile = FALSE)
+
+fit_lowres <- ppmlasso(form_bis, data = myppmdata_lowres, lamb = lamb, sp.scale = 1000, 
+                       r = 2000, family = "area.inter",
+                       coord=c("X","Y"), standardise = TRUE, writefile = FALSE)
+
+mu_nothin <- predict.ppmlasso(object = fit_lowres, newdata = bg,
+                              interactions = rep(0, nrow(bg)))
+
+myppmdata_thinned <- map(thinning_lvls, ~ c(sample(1:ncoll, .x),
+                                            (ncoll+1):nrow(myppmdata_lowres))) %>%
+  map(~myppmdata_lowres[.x, ])
+
+fit_thinned <- map(myppmdata_thinned, 
+                   ~ ppmlasso(form_bis, data = .x, lamb = lamb, sp.scale = 1000, 
+                              r = 2000, family = "area.inter", 
+                              coord=c("X","Y"), standardise = TRUE, writefile = FALSE))
+
+mu_thinned <- map(fit_thinned, ~ predict.ppmlasso(object = .x, newdata = bg,
+                                                  interactions = rep(0, nrow(bg))))
+
+spear <-  map(mu_thinned, ~ cor(.x[bg$roadImportance <= 3],
+                                  mu_nothin[bg$roadImportance <= 3],
+                                  method = "spearman")) %>%
+  reduce(c)
+
+jaccard <- function(a, b){
+  u <- intersect(a,b)
+  length(u) / (length(a) + length(b) - length(u))
+}
+
+jacc <-  map(mu_thinned, ~ jaccard(which(.x > quantile(.x, 0.95)),
+                                   which(mu_nothin > quantile(mu_nothin, 0.95)))) %>%
+  reduce(c)
+
+p1 <- data.frame(thin = thinning_lvls,
+                 spearman_coeff = spear,
+                 jaccard_coeff= jacc) %>%
+  group_by(thin)%>%
+  summarize(inf = quantile(jaccard_coeff, 0.25),
+            med = quantile(jaccard_coeff, 0.5),
+            sup = quantile(jaccard_coeff, 0.75)) %>%
+  ggplot()+
+  geom_pointrange(aes(x = thin, ymin = inf, y = med, ymax =  sup))+
+  xlab("number of collision records") + ylab("Jaccard coefficient")+
+  theme_bw()
+
+```
+
+```{r covariate stability}
+
+pred_all <- imap(mu_thinned,
+                 ~ mutate(bg,
+                          mu = .x,
+                          id = .y,
+                          thinning = thinning_lvls[.y]) %>%
+                   filter(1:n() %in% sample(1:n(), 50000))) %>%
+  reduce(rbind) %>%
+  filter(thinning %in% c(80, 160, 240, 326))
+
+
+pred_all_longer <- pivot_longer(pred_all,
+                                cols = c("roadImportance", "maxStra",
+                                         "distRoad", "otterPresence",
+                                         "treeCover", "distLake", "roads"))
+  
+p2 <- ggplot() +
+    geom_smooth(data = filter(pred_all_longer, name != "maxStra", thinning != 326), 
+                aes(x = value, y = log(mu), color = factor(thinning), group = id),
+                se = FALSE, linewidth = 0.33, method = "lm", formula = y ~ ns(x, df = 3)) +
+    geom_smooth(data = filter(pred_all_longer, name != "maxStra", thinning == 326), 
+                aes(x = value, y = log(mu), group = id),
+                se = FALSE, col = "black", method = "lm", formula = y ~ ns(x, df = 3)) +
+    geom_smooth(data = filter(pred_all_longer, name == "maxStra", 
+                              crossings3 == 0, thinning != 326), 
+                aes(x = value, y = log(mu), color = factor(thinning), 
+                    group = id),
+                se = FALSE, linewidth = 0.33, method = "lm", formula = y ~ ns(x, df = 3)) +
+    geom_smooth(data = filter(pred_all_longer, name == "maxStra", 
+                              crossings3 == 0, thinning == 326), 
+                aes(x = value, y = log(mu), group = id),
+                se = FALSE, col = "black", method = "lm", formula = y ~ ns(x, df = 3)) +
+  geom_smooth(data = filter(pred_all_longer, name == "maxStra", 
+                              crossings3 == 1, thinning != 326), 
+              aes(x = value, y = log(mu), color = factor(thinning), 
+                  group = id),
+              se = FALSE, linewidth = 0.33, linetype = "dashed",
+              method = "lm", formula = y ~ ns(x, df = 3)) +
+    geom_smooth(data = filter(pred_all_longer, name == "maxStra", 
+                              crossings3 == 1, thinning == 326), 
+                aes(x = value, y = log(mu), group = id),
+                se = FALSE, col = "black", linetype = "dashed",
+              method = "lm", formula = y ~ ns(x, df = 3)) +
+  facet_wrap(~ name, scales = "free") +
+  scale_color_discrete(name = "number of collision records")+
+  xlab("") +
+  theme_bw()+
+  theme(legend.position = "bottom")
+
+ggpubr::ggarrange(p1, p2, widths = c(0.33, 0.66))
+```
+
+### 5. Stability to alternative covariate definitions
+
+```{r stability to covs.}
+
+form1 <- ~ (rivers == 0) + ns(roadImportance, df = 3) + 
+  crossings1 * (roads + (otterPresence != 0) + 
+                  altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + 
+                  exp(-distLake/1000) + exp(-distCoast/10000) +
+                  exp(-distUrban/500) + exp(-distRoad/500))
+
+form2 <- ~ (rivers == 0) + ns(roadImportance, df = 3) + 
+  crossings2 * (roads + (otterPresence != 0) + 
+                  altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + 
+                  exp(-distLake/1000) + exp(-distCoast/10000) +
+                  exp(-distUrban/500) + exp(-distRoad/500))
+
+form3 <- ~ (rivers == 0) + ns(roadImportance, df = 3) + 
+  crossings3 * (roads + (otterPresence != 0) + 
+                  altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + 
+                  exp(-distLake/1000) + exp(-distCoast/10000) +
+                  exp(-distUrban/500) + exp(-distRoad/500))
+
+form4 <- ~ (rivers == 0) + ns(roadImportance, df = 3) + 
+  crossings4 * (roads + (otterPresence != 0) + 
+                  altitude + cultures + treeCover + wetlands  +
+                  rivers + ns(maxStra, df = 3) + 
+                  exp(-distLake/1000) + exp(-distCoast/10000) +
+                  exp(-distUrban/500) + exp(-distRoad/500))
+
+fit1 <- ppmlasso(form1, data = myppmdata, lamb = fit$lambda, sp.scale = res, coord=c("X","Y"),
+                r = rad, family = "area.inter", standardise = TRUE, writefile = FALSE)
+fit2 <- ppmlasso(form2, data = myppmdata, lamb = fit$lambda, sp.scale = res, coord=c("X","Y"),
+                r = rad, family = "area.inter", standardise = TRUE, writefile = FALSE)
+fit3 <- ppmlasso(form3, data = myppmdata, lamb = fit$lambda, sp.scale = res, coord=c("X","Y"),
+                r = rad, family = "area.inter", standardise = TRUE, writefile = FALSE)
+fit4 <- ppmlasso(form4, data = myppmdata, lamb = fit$lambda, sp.scale = res, coord=c("X","Y"),
+                r = rad, family = "area.inter", standardise = TRUE, writefile = FALSE)
+
+mu1 <- predict.ppmlasso(object = fit1, newdata = bg, interactions = rep(0, nrow(bg)))*res**2
+mu2 <- predict.ppmlasso(object = fit2, newdata = bg, interactions = rep(0, nrow(bg)))*res**2
+mu3 <- predict.ppmlasso(object = fit3, newdata = bg, interactions = rep(0, nrow(bg)))*res**2
+mu4 <- predict.ppmlasso(object = fit4, newdata = bg, interactions = rep(0, nrow(bg)))*res**2
+
+jaccard <- function(a, b){
+  u <- intersect(a,b)
+  length(u) / (length(a) + length(b) - length(u))
+}
+jacc1 <- jaccard(which(mu1> quantile(mu1, 0.95)),
+                 which(mu3 > quantile(mu3, 0.95)))
+jacc2 <- jaccard(which(mu2> quantile(mu2, 0.95)),
+                 which(mu3 > quantile(mu3, 0.95)))
+jacc3 <- jaccard(which(mu3> quantile(mu3, 0.95)),
+                 which(mu3 > quantile(mu3, 0.95)))
+jacc4 <- jaccard(which(mu4> quantile(mu4, 0.95)),
+                 which(mu3 > quantile(mu3, 0.95)))
+
+p1 <- data.frame(treatment = c("cross1", "cross2", "cross3", "cross4"),
+                 lik = c(fit1$likelihood, fit2$likelihood, fit3$likelihood, fit4$likelihood))%>%
+
+  ggplot()+
+  geom_point(aes(x = treatment, y = lik))+
+  xlab("") + ylab("Model log likelihood")+
+  theme_bw()
+
+p2 <- data.frame(treatment = c("cross1", "cross2", "cross3", "cross4"),
+                 jacc = c(jacc1, jacc2, jacc3, jacc4)) %>%
+
+  ggplot()+
+  geom_point(aes(x = treatment, y = jacc))+
+  xlab("") + ylab("Jaccard coefficient")+
+  theme_bw()
+
+pred_all <- imap(list(cross1 = mu1, cross2 = mu2, cross3 = mu3,
+                       cross4 = mu4),
+                  ~ mutate(bg, mu = .x, treatment = .y)) %>%
+  reduce(rbind) %>%
+  mutate(otterDensity = otterDensity *1e06)
+  
+pred_all_longer <- pivot_longer(pred_all,
+                                cols = c("roadImportance", "maxStra",
+                                         "distRoad", "otterPresence",
+                                         "treeCover", "distLake", "roads")) %>%
+  filter(!((name %in% c("distLake", "distRoad"))&(value>5000)))
+  
+p3 <- ggplot() +
+    geom_smooth(data = filter(pred_all_longer, name != "maxStra"), 
+                aes(x = value, y = log(mu), color = treatment),
+                se = FALSE, linewidth = 0.33, method = "lm", formula = y ~ ns(x, df = 3)) +
+    geom_smooth(data = filter(pred_all_longer, name == "maxStra", 
+                              crossings3 == 0), 
+                aes(x = value, y = log(mu), color = treatment),
+                se = FALSE, linewidth = 0.33, method = "lm", formula = y ~ ns(x, df = 3)) +
+  geom_smooth(data = filter(pred_all_longer, name == "maxStra", 
+                            crossings3 == 1), 
+              aes(x = value, y = log(mu), color = treatment),
+              se = FALSE, linewidth = 0.33, linetype = "dashed",
+              method = "lm", formula = y ~ ns(x, df = 3)) +
+  facet_wrap(~ name, scales = "free", ncol = 4) +
+  scale_color_discrete(name = "")+
+  xlab("") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+ggpubr::ggarrange(ggpubr::ggarrange(p1, p2), p3, nrow = 2, heights = c(0.33,0.66))
+ggsave("out/supp_altCovs.png", width = 21, height = 15, units = "cm" )
+```
+
